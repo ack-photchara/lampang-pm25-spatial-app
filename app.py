@@ -6,48 +6,61 @@ import folium
 import joblib
 from streamlit_folium import st_folium
 
-st.set_page_config(page_title="Lampang PM2.5 Spatial Monitoring", page_icon="🌫️", layout="wide")
-st.title("🌫️ ระบบแผนที่ติดตาม PM2.5 เชิงพื้นที่ 225 จุด (อ.เมืองลำปาง)")
-st.caption("Random Forest Regression Model (10-Fold CV Aligned)")
+st.set_page_config(
+    page_title="Lampang PM2.5 Spatial Monitoring",
+    page_icon="🌫️",
+    layout="wide"
+)
 
-# 1. โหลดโมเดล .pkl
+st.title("🌫️ ระบบแผนที่ติดตาม PM2.5 เชิงพื้นที่ 225 จุด (อ.เมืองลำปาง)")
+st.caption("ระบบจำลองและคาดการณ์ตามโครงสร้างภูมิประเทศแอ่งกระทะ (Two-Stage Machine Learning)")
+
+# 1. โหลดโมเดล Random Forest
 @st.cache_resource
 def load_rf_model():
     return joblib.load("rf_stage1_model.pkl")
 
 rf_model = load_rf_model()
 
-# 2. ดึงค่าฝุ่นจริงจาก Air4Thai (สถานี 35t)
-@st.cache_data(ttl=600)
+# 2. ดึงค่าฝุ่นจริงจาก Air4Thai API แบบแม่นยำ
+@st.cache_data(ttl=300)
 def fetch_live_air4thai(station_code="35t"):
+    headers = {"User-Agent": "Mozilla/5.0"}
     url = "http://air4thai.pcd.go.th/forappV2/getAQI_JSON.php"
     try:
-        res = requests.get(url, timeout=5).json()
+        res = requests.get(url, headers=headers, timeout=5).json()
         for station in res.get("stations", []):
             if station.get("stationID") == station_code:
-                pm_val = float(station.get("LastUpdate", {}).get("PM25", {}).get("value", 12.0))
-                time_str = station.get("LastUpdate", {}).get("date") + " " + station.get("LastUpdate", {}).get("time")
-                return {"pm25": pm_val, "station_name": station.get("nameTH"), "datetime": time_str}
-        return {"pm25": 12.0, "station_name": "สถานีพระบาท ลำปาง", "datetime": "ล่าสุด"}
+                last_up = station.get("LastUpdate", {})
+                pm_val = float(last_up.get("PM25", {}).get("value", 10.3))
+                date_str = last_up.get("date", "")
+                time_str = last_up.get("time", "")
+                return {
+                    "pm25": pm_val,
+                    "station_name": station.get("nameTH", "สถานีพระบาท อ.เมือง ลำปาง"),
+                    "datetime": f"{date_str} {time_str}",
+                    "status": "Online (Air4Thai Live)"
+                }
+        return {"pm25": 10.3, "station_name": "สถานีพระบาท อ.เมือง ลำปาง", "datetime": "ล่าสุด", "status": "Fallback"}
     except Exception:
-        return {"pm25": 12.0, "station_name": "สถานีพระบาท ลำปาง", "datetime": "ล่าสุด"}
+        return {"pm25": 10.3, "station_name": "สถานีพระบาท อ.เมือง ลำปาง", "datetime": "ล่าสุด", "status": "Offline"}
 
 # 3. ดึงสภาพอากาศสด Open-Meteo
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)
 def fetch_live_weather():
     url = "https://api.open-meteo.com/v1/forecast?latitude=18.2888&longitude=99.5056&current=temperature_2m,relative_humidity_2m,wind_speed_10m"
     try:
         res = requests.get(url, timeout=5).json()
         curr = res.get("current", {})
         return {
-            "temp": float(curr.get("temperature_2m", 28.5)),
-            "rh": float(curr.get("relative_humidity_2m", 65.0)),
+            "temp": float(curr.get("temperature_2m", 25.8)),
+            "rh": float(curr.get("relative_humidity_2m", 83.0)),
             "wind": float(curr.get("wind_speed_10m", 5.2))
         }
     except Exception:
-        return {"temp": 28.5, "rh": 65.0, "wind": 5.2}
+        return {"temp": 25.8, "rh": 83.0, "wind": 5.2}
 
-# 4. โหลดตารางกริด 225 จุด
+# 4. โหลดตารางกริดความสูงจริง
 @st.cache_data
 def load_grid_data():
     return pd.read_csv("grid_lampang.csv")
@@ -56,56 +69,74 @@ live_air = fetch_live_air4thai("35t")
 live_weather = fetch_live_weather()
 df_grid = load_grid_data().copy()
 
-# 5. Sidebar โหมดการทำงาน
-st.sidebar.header("🎛️ แผงควบคุม")
-app_mode = st.sidebar.radio("เลือกโหมด:", ["📡 ข้อมูลสด (Real-Time Live)", "🧪 จำลองสถานการณ์ (What-If Simulator)"])
+# 5. Sidebar ควบคุม
+st.sidebar.header("🎛️ แผงควบคุมและสถานการณ์")
+app_mode = st.sidebar.radio("เลือกโหมดการทำงาน:", ["📡 แสดงผลข้อมูลสด (Real-Time Live)", "🧪 จำลองสถานการณ์ (What-If Simulator)"])
 
-if app_mode == "📡 ข้อมูลสด (Real-Time Live)":
-    st.sidebar.success(f"เชื่อมต่อ: {live_air['station_name']}")
-    pm_input = float(live_air["pm25"])
+if app_mode == "📡 แสดงผลข้อมูลสด (Real-Time Live)":
+    st.sidebar.success(f"เชื่อมต่อ: {live_air['status']}")
+    st.sidebar.caption(f"{live_air['station_name']} ({live_air['datetime']})")
+    
+    # ดึงค่ามาตรฐาน Air4Thai มาตรงๆ
+    pm_base_ref = float(live_air["pm25"])
     temp_val = float(live_weather["temp"])
     rh_val = float(live_weather["rh"])
     wind_val = float(live_weather["wind"])
+
 else:
-    temp_val = st.sidebar.slider("อุณหภูมิ (°C)", 15.0, 45.0, float(live_weather["temp"]))
-    rh_val = st.sidebar.slider("ความชื้นสัมพัทธ์ RH (%)", 10.0, 100.0, float(live_weather["rh"]))
-    wind_val = st.sidebar.slider("ความเร็วลม (km/h)", 0.0, 30.0, float(live_weather["wind"]))
-    pm_input = st.sidebar.number_input("ค่าฝุ่นฐาน (µg/m³)", value=float(live_air["pm25"]))
+    st.sidebar.subheader("🧪 What-If Controls")
+    preset = st.sidebar.selectbox("เลือก Preset:", ["กำหนดค่าเอง", "🔴 วิกฤตหมอกควันปิดเมือง", "🟢 ลมพัดระบายหลังฝน"])
+    if preset == "🔴 วิกฤตหมอกควันปิดเมือง":
+        d_temp, d_rh, d_wind, d_pm = 32.0, 85.0, 1.2, 75.0
+    elif preset == "🟢 ลมพัดระบายหลังฝน":
+        d_temp, d_rh, d_wind, d_pm = 24.0, 45.0, 18.0, 20.0
+    else:
+        d_temp, d_rh, d_wind, d_pm = live_weather["temp"], live_weather["rh"], live_weather["wind"], live_air["pm25"]
 
-# 6. ส่งเข้าโมเดล Random Forest ทำนายทั้ง 225 จุด
-features_matrix = pd.DataFrame({
-    'pm25_raw': pm_input,
-    'rh': rh_val,
-    'temp': temp_val,
-    'wind_speed': wind_val,
-    'elevation': df_grid['elevation']
-})
+    temp_val = st.sidebar.slider("อุณหภูมิ (°C)", 15.0, 45.0, float(d_temp))
+    rh_val = st.sidebar.slider("ความชื้นสัมพัทธ์ RH (%)", 10.0, 100.0, float(d_rh))
+    wind_val = st.sidebar.slider("ความเร็วลม (km/h)", 0.0, 30.0, float(d_wind))
+    raw_input = st.sidebar.number_input("ค่าฝุ่นดิบ DustBoy (µg/m³)", value=float(d_pm))
 
-df_grid['pm25_pred'] = rf_model.predict(features_matrix)
+    # คำนวณ Stage 1 ด้วย Random Forest เพื่อปรับแก้ค่าดิบ
+    test_feature = pd.DataFrame([{
+        'pm25_raw': raw_input,
+        'rh': rh_val,
+        'temp': temp_val,
+        'wind_speed': wind_val,
+        'elevation': 240.0
+    }])
+    pm_base_ref = float(rf_model.predict(test_feature)[0])
 
-# 7. แสดง KPIs
+# 6. Stage 2 Spatial Downscaling ตามความชันความสูง (Elevation Topography)
+min_elev = df_grid["elevation"].min()
+df_grid["pm25_pred"] = pm_base_ref - ((df_grid["elevation"] - min_elev) * 0.04)
+df_grid["pm25_pred"] = df_grid["pm25_pred"].clip(lower=2.0)
+
+# แสดงสรุปผล KPIs
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("ค่าฝุ่นฐานสถานี", f"{pm_input:.1f} µg/m³")
-c2.metric("อุณหภูมิ", f"{temp_val:.1f} °C")
-c3.metric("ความชื้น (RH)", f"{rh_val:.1f} %")
-c4.metric("ช่วงค่าฝุ่นบนกริด", f"{df_grid['pm25_pred'].min():.1f} - {df_grid['pm25_pred'].max():.1f} µg/m³")
+c1.metric("ค่าฝุ่นอ้างอิงในเมือง", f"{pm_base_ref:.1f} µg/m³")
+c2.metric("อุณหภูมิปัจจุบัน", f"{temp_val:.1f} °C")
+c3.metric("ความชื้นสัมพัทธ์ (RH)", f"{rh_val:.1f} %")
+c4.metric("ช่วงค่าฝุ่น 225 จุด", f"{df_grid['pm25_pred'].min():.1f} - {df_grid['pm25_pred'].max():.1f} µg/m³")
 
-# 8. พล็อตแผนที่ OpenStreetMap (ไม่มีลายน้ำ)
-def get_aqi_color(pm):
-    if pm >= 50.0: return "#FF0000"
-    elif pm >= 37.5: return "#FF8C00"
-    elif pm >= 25.0: return "#FFD700"
-    elif pm >= 15.0: return "#2ECC71"
-    else: return "#00BFFF"
+# 7. แผนที่ Folium แสดงสีตามเกณฑ์จริง
+def get_color(pm):
+    if pm >= 50.0: return "#FF0000"    # สีแดง (มีผลกระทบ)
+    elif pm >= 37.5: return "#FF8C00"  # สีส้ม (เริ่มมีผลกระทบ)
+    elif pm >= 25.0: return "#FFD700"  # สีเหลือง (ปานกลาง)
+    elif pm >= 15.0: return "#2ECC71"  # สีเขียว (ดี)
+    else: return "#00BFFF"             # สีฟ้า (ดีมาก)
 
 m = folium.Map(location=[18.275, 99.475], zoom_start=11, tiles="OpenStreetMap")
+
 for _, row in df_grid.iterrows():
     folium.CircleMarker(
         location=[row["lat"], row["lon"]],
         radius=7,
-        color=get_aqi_color(row["pm25_pred"]),
+        color=get_color(row["pm25_pred"]),
         fill=True,
-        fill_color=get_aqi_color(row["pm25_pred"]),
+        fill_color=get_color(row["pm25_pred"]),
         fill_opacity=0.85,
         weight=1,
         popup=f"<b>{row['grid_id']}</b><br>PM2.5: {row['pm25_pred']:.2f} µg/m³<br>Elevation: {row['elevation']:.1f} m"
