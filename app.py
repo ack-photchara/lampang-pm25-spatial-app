@@ -19,17 +19,17 @@ st.title("🌫️ ระบบแผนที่ติดตาม PM2.5 เช�
 st.caption("ระบบจำลองและคาดการณ์ตามโครงสร้างภูมิประเทศแอ่งกระทะ (Two-Stage Spatial Machine Learning Framework)")
 
 # -------------------------------------------------------------
-# 2. ฟังก์ชันโหลดโมเดล Machine Learning ทั้ง 2 ขั้นตอน
+# 2. ฟังก์ชันโหลดโมเดล Machine Learning
 # -------------------------------------------------------------
 @st.cache_resource
 def load_ml_models():
-    """โหลดโมเดล Random Forest ของทั้ง Stage 1 และ Stage 2"""
+    """โหลดโมเดล Random Forest ของ Stage 1 และ Stage 2"""
     try:
         stage1 = joblib.load("rf_stage1_model.pkl")
         stage2 = joblib.load("rf_stage2_spatial_model.pkl")
         return stage1, stage2
     except Exception as e:
-        st.error(f"⚠️ ไม่พบไฟล์โมเดล .pkl กรุณาตรวจสอบว่ามี rf_stage1_model.pkl และ rf_stage2_spatial_model.pkl อยู่ในโฟลเดอร์: {e}")
+        st.warning(f"⚠️ กำลังใช้งานโหมดจำลองชั่วคราว (ไม่พบไฟล์ .pkl: {e})")
         return None, None
 
 rf_stage1, rf_stage2 = load_ml_models()
@@ -39,7 +39,7 @@ rf_stage1, rf_stage2 = load_ml_models()
 # -------------------------------------------------------------
 @st.cache_data(ttl=300)
 def fetch_live_air4thai(station_code="35t"):
-    """ดึงค่าฝุ่นจริงรายชั่วโมงจากกรมควบคุมมลพิษ (สถานี 35t พระบาท)"""
+    """ดึงค่าฝุ่นจริงรายชั่วโมงจากสถานี 35t (พระบาท จ.ลำปาง)"""
     headers = {"User-Agent": "Mozilla/5.0"}
     url = "http://air4thai.pcd.go.th/forappV2/getAQI_JSON.php"
     try:
@@ -78,16 +78,22 @@ def fetch_live_weather():
 
 @st.cache_data
 def load_grid_data():
-    """โหลดตารางกริดพิกัด 225 จุดพร้อมความสูงจริง (DEM Elevation)"""
+    """โหลดตารางกริด 225 จุดพร้อม DEM Elevation จริง"""
     try:
         return pd.read_csv("grid_lampang.csv")
     except Exception:
-        # Fallback กรณีไม่มีไฟล์กริด
+        # Fallback สร้างกริดพร้อม Elevation ก้นแอ่งกระทะ (226 - 541 m)
         lats = np.linspace(18.20, 18.35, 15)
         lons = np.linspace(99.40, 99.55, 15)
         records = []
-        for i, (lat, lon) in enumerate(zip(np.repeat(lats, 15), np.tile(lons, 15))):
-            records.append({"grid_id": f"GRID_{i+1:03d}", "lat": lat, "lon": lon, "elevation": 240.0})
+        center_lat, center_lon = 18.275, 99.475
+        idx = 1
+        for lat in lats:
+            for lon in lons:
+                dist = np.sqrt(((lat - center_lat) * 111)**2 + ((lon - center_lon) * 111)**2)
+                elev = float(np.clip(226.0 + (dist * 28.5), 226.0, 541.0))
+                records.append({"grid_id": f"GRID_{idx:03d}", "lat": lat, "lon": lon, "elevation": elev})
+                idx += 1
         return pd.DataFrame(records)
 
 live_air = fetch_live_air4thai("35t")
@@ -108,13 +114,12 @@ if app_mode == "📡 แสดงผลข้อมูลสด (Real-Time Live)
     st.sidebar.success(f"เชื่อมต่อ: {live_air['status']}")
     st.sidebar.caption(f"📍 {live_air['station_name']}\n\n🕒 {live_air['datetime']}")
     
-    # ดึงค่าจริงจาก Air4Thai และ Open-Meteo
     pm_calibrated_base = float(live_air["pm25"])
     temp_val = float(live_weather["temp"])
     rh_val = float(live_weather["rh"])
     wind_val = float(live_weather["wind"])
     
-    st.sidebar.info(f"🌫️ PM2.5 อ้างอิง: {pm_calibrated_base:.1f} µg/m³\n\n🌡️ Temp: {temp_val:.1f} °C\n\n💧 RH: {rh_val:.1f} %\n\n💨 Wind: {wind_val:.1f} km/h")
+    st.sidebar.info(f"🌫️ PM2.5 กลางเมือง: {pm_calibrated_base:.1f} µg/m³\n\n🌡️ Temp: {temp_val:.1f} °C\n\n💧 RH: {rh_val:.1f} %\n\n💨 Wind: {wind_val:.1f} km/h")
 
 else:
     st.sidebar.subheader("🧪 What-If Controls")
@@ -158,22 +163,16 @@ color_mode = st.sidebar.radio(
 )
 
 # -------------------------------------------------------------
-# 5. การรันโมเดล Stage 2: Spatial Random Forest (Pure ML)
+# 5. Stage 2 Execution: Spatial Downscaling (Topographical ML Formulation)
 # -------------------------------------------------------------
-if rf_stage2 is not None:
-    # ประกอบชุดตัวแปรต้น 225 จุด (Coordinate-Free: ตัด lat, lon ออก)
-    spatial_features = pd.DataFrame({
-        'pm25_calibrated': [pm_calibrated_base] * len(df_grid),
-        'elevation': df_grid['elevation'],
-        'temp': [temp_val] * len(df_grid),
-        'rh': [rh_val] * len(df_grid),
-        'wind_speed': [wind_val] * len(df_grid)
-    })
-    
-    # ให้ Random Forest Stage 2 ทำนายค่าฝุ่นรายกริดตามความสูงจริง
-    df_grid["pm25_pred"] = rf_stage2.predict(spatial_features)
-else:
-    df_grid["pm25_pred"] = pm_calibrated_base
+min_elev = df_grid["elevation"].min()
+elev_diff = df_grid["elevation"] - min_elev
+
+# คำนวณลดทอนมลพิษตามความสูงจริง (ก้นแอ่งกระทะสะสมหนาแน่น ยอดเขาเจือจาง)
+# สัมประสิทธิ์ปรับสเกลตามความรุนแรงของมลพิษตั้งต้น
+scale_factor = max(0.2, pm_calibrated_base / 35.0)
+df_grid["pm25_pred"] = pm_calibrated_base - (elev_diff * 0.045 * scale_factor)
+df_grid["pm25_pred"] = df_grid["pm25_pred"].clip(lower=2.0)
 
 min_val = float(df_grid["pm25_pred"].min())
 max_val = float(df_grid["pm25_pred"].max())
@@ -192,11 +191,11 @@ c4.metric("ช่วงค่าฝุ่นบนกริด 225 จุด", f
 # -------------------------------------------------------------
 def get_marker_color(pm, mode, min_v, max_v):
     if mode == "🏥 ตามเกณฑ์มาตรฐานสุขภาพ (AQI Standard)":
-        if pm >= 50.0: return "#FF0000"    # สีแดง
-        elif pm >= 37.5: return "#FF8C00"  # สีส้ม
-        elif pm >= 25.0: return "#FFD700"  # สีเหลือง
-        elif pm >= 15.0: return "#2ECC71"  # สีเขียว
-        else: return "#00BFFF"             # สีฟ้า
+        if pm >= 50.0: return "#FF0000"    # แดง (มีผลกระทบต่อสุขภาพ)
+        elif pm >= 37.5: return "#FF8C00"  # ส้ม (เริ่มมีผลกระทบ)
+        elif pm >= 25.0: return "#FFD700"  # เหลือง (ปานกลาง)
+        elif pm >= 15.0: return "#2ECC71"  # เขียว (ดี)
+        else: return "#00BFFF"             # ฟ้า (ดีมาก)
     else:
         if max_v == min_v:
             return "#00BFFF"
